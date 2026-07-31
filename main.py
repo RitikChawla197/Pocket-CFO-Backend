@@ -343,98 +343,66 @@ Respond ONLY with valid JSON inside a ```json block or raw JSON object.
     custom_key = snapshot.api_key.strip() if snapshot.api_key else None
 
     # Server-side environment key fallbacks
-    groq_env_key = os.getenv("GROQ_API_KEY")
     openrouter_env_key = os.getenv("OPENROUTER_API_KEY")
     gemini_env_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
     anthropic_env_key = os.getenv("ANTHROPIC_API_KEY")
 
     # If offline requested or no key anywhere, use local heuristic CFO engine
     if selected_provider in ["offline", "heuristic"] or (
-        not custom_key and not groq_env_key and not openrouter_env_key and not gemini_env_key and not anthropic_env_key
+        not custom_key and not openrouter_env_key and not gemini_env_key and not anthropic_env_key
     ):
         res = generate_heuristic_cfo_insight(snapshot)
         return CFOInsightResponse(**res)
 
-    # 1. Handle Groq API (100% Free, High Rate-Limits)
-    if selected_provider == "groq" or (custom_key and custom_key.startswith("gsk_")) or (not custom_key and groq_env_key):
-        active_key = custom_key or groq_env_key
-        try:
-            url = "https://api.groq.com/openai/v1/chat/completions"
-            headers = {
-                "Authorization": f"Bearer {active_key}",
-                "Content-Type": "application/json"
-            }
-            payload = {
-                "model": "llama-3.3-70b-versatile",
-                "messages": [{"role": "user", "content": prompt_text}],
-                "response_format": {"type": "json_object"},
-                "temperature": 0.3
-            }
-            async with httpx.AsyncClient(timeout=15.0) as client:
-                resp = await client.post(url, headers=headers, json=payload)
-                res_data = resp.json()
-                if resp.status_code == 200:
-                    raw_text = res_data["choices"][0]["message"]["content"]
-                    cleaned_text = raw_text.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
-                    parsed = json.loads(cleaned_text)
-                    return CFOInsightResponse(
-                        verdict=parsed.get("verdict", "WEALTH_BUILDING"),
-                        summary=parsed.get("summary", ""),
-                        recommendations=parsed.get("recommendations", [])
-                    )
-                else:
-                    err_msg = res_data.get("error", {}).get("message", f"Groq HTTP {resp.status_code}")
-                    print(f"Groq API Error ({resp.status_code}): {err_msg}")
-                    raise HTTPException(
-                        status_code=resp.status_code if resp.status_code in [400, 401, 403, 429] else 400,
-                        detail=f"Groq API Error: {err_msg}"
-                    )
-        except HTTPException:
-            raise
-        except Exception as e:
-            print(f"Groq Exception: {e}")
-            res = generate_heuristic_cfo_insight(snapshot)
-            return CFOInsightResponse(**res)
-
-    # 2. Handle OpenRouter API (Completely Free Models Available)
+    # 1. Handle OpenRouter API (Auto-fallback across active free models)
     if selected_provider == "openrouter" or (custom_key and custom_key.startswith("sk-or-")) or (not custom_key and openrouter_env_key):
         active_key = custom_key or openrouter_env_key
+        openrouter_models = [
+            "google/gemma-2-9b-it:free",
+            "meta-llama/llama-3.1-8b-instruct:free",
+            "mistralai/mistral-7b-instruct:free",
+            "qwen/qwen-2.5-72b-instruct:free",
+            "deepseek/deepseek-r1:free"
+        ]
+        
         try:
             url = "https://openrouter.ai/api/v1/chat/completions"
             headers = {
                 "Authorization": f"Bearer {active_key}",
                 "Content-Type": "application/json"
             }
-            payload = {
-                "model": "meta-llama/llama-3.3-70b-instruct:free",
-                "messages": [{"role": "user", "content": prompt_text}],
-                "temperature": 0.3
-            }
+            
             async with httpx.AsyncClient(timeout=15.0) as client:
-                resp = await client.post(url, headers=headers, json=payload)
-                res_data = resp.json()
-                if resp.status_code == 200:
-                    raw_text = res_data["choices"][0]["message"]["content"]
-                    cleaned_text = raw_text.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
-                    parsed = json.loads(cleaned_text)
-                    return CFOInsightResponse(
-                        verdict=parsed.get("verdict", "WEALTH_BUILDING"),
-                        summary=parsed.get("summary", ""),
-                        recommendations=parsed.get("recommendations", [])
-                    )
-                else:
-                    err_msg = res_data.get("error", {}).get("message", f"OpenRouter HTTP {resp.status_code}")
-                    print(f"OpenRouter API Error ({resp.status_code}): {err_msg}")
-                    raise HTTPException(
-                        status_code=resp.status_code if resp.status_code in [400, 401, 403, 429] else 400,
-                        detail=f"OpenRouter API Error: {err_msg}"
-                    )
-        except HTTPException:
-            raise
+                last_err = "No OpenRouter free model available"
+                for model_name in openrouter_models:
+                    payload = {
+                        "model": model_name,
+                        "messages": [{"role": "user", "content": prompt_text}],
+                        "temperature": 0.3
+                    }
+                    resp = await client.post(url, headers=headers, json=payload)
+                    res_data = resp.json()
+                    if resp.status_code == 200 and "choices" in res_data and len(res_data["choices"]) > 0:
+                        raw_text = res_data["choices"][0]["message"]["content"]
+                        cleaned_text = raw_text.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+                        parsed = json.loads(cleaned_text)
+                        return CFOInsightResponse(
+                            verdict=parsed.get("verdict", "WEALTH_BUILDING"),
+                            summary=parsed.get("summary", ""),
+                            recommendations=parsed.get("recommendations", [])
+                        )
+                    else:
+                        last_err = res_data.get("error", {}).get("message", f"OpenRouter HTTP {resp.status_code}")
+                        print(f"OpenRouter Model {model_name} Error ({resp.status_code}): {last_err}")
+                
+                print(f"All OpenRouter models failed. Last error: {last_err}. Falling back to heuristic CFO engine.")
+                res = generate_heuristic_cfo_insight(snapshot)
+                return CFOInsightResponse(**res)
         except Exception as e:
             print(f"OpenRouter Exception: {e}")
             res = generate_heuristic_cfo_insight(snapshot)
             return CFOInsightResponse(**res)
+
 
     # 3. Handle Anthropic Claude API
     if selected_provider == "anthropic" or (custom_key and custom_key.startswith("sk-ant-")) or (not custom_key and anthropic_env_key):
