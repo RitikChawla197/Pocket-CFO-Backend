@@ -10,34 +10,61 @@ from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
 from dotenv import load_dotenv
 
+import psycopg2
+
 load_dotenv()
 
-DB_PATH = "cfo_dashboard.db"
+DATABASE_URL = os.getenv("POSTGRES_URL") or os.getenv("DATABASE_URL")
+
+def get_db_connection():
+    if DATABASE_URL:
+        db_url = DATABASE_URL
+        if db_url.startswith("postgres://"):
+            db_url = db_url.replace("postgres://", "postgresql://", 1)
+        return psycopg2.connect(db_url)
+    else:
+        return sqlite3.connect("cfo_dashboard.db")
 
 def init_db():
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL,
-            email TEXT UNIQUE NOT NULL,
-            password_hash TEXT NOT NULL,
-            created_at TEXT NOT NULL
-        )
-    """)
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS user_financial_data (
-            user_id INTEGER PRIMARY KEY,
-            data_json TEXT NOT NULL,
-            updated_at TEXT NOT NULL,
-            FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
-        )
-    """)
+    if DATABASE_URL:
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                id SERIAL PRIMARY KEY,
+                name TEXT NOT NULL,
+                email TEXT UNIQUE NOT NULL,
+                password_hash TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS user_financial_data (
+                user_id INTEGER PRIMARY KEY REFERENCES users (id) ON DELETE CASCADE,
+                data_json TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+        """)
+    else:
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                email TEXT UNIQUE NOT NULL,
+                password_hash TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS user_financial_data (
+                user_id INTEGER PRIMARY KEY,
+                data_json TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+            )
+        """)
     conn.commit()
     conn.close()
-
-init_db()
 
 app = FastAPI(title="Personal CFO AI Insights API")
 
@@ -48,6 +75,13 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+@app.on_event("startup")
+def startup_db_init():
+    try:
+        init_db()
+    except Exception as e:
+        print(f"Startup DB init log: {e}")
 
 class RegisterRequest(BaseModel):
     name: str
@@ -85,21 +119,41 @@ def register_user(req: RegisterRequest):
     if not email or not req.password:
         raise HTTPException(status_code=400, detail="Email and password are required")
 
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT id FROM users WHERE email = ?", (email,))
+    if DATABASE_URL:
+        cursor.execute("SELECT id FROM users WHERE email = %s", (email,))
+    else:
+        cursor.execute("SELECT id FROM users WHERE email = ?", (email,))
+
     if cursor.fetchone():
         conn.close()
         raise HTTPException(status_code=400, detail="User with this email already exists")
 
     pw_hash = hash_password(req.password)
     now = datetime.now().isoformat()
-    cursor.execute("INSERT INTO users (name, email, password_hash, created_at) VALUES (?, ?, ?, ?)",
-                   (name, email, pw_hash, now))
-    user_id = cursor.lastrowid
 
-    cursor.execute("INSERT INTO user_financial_data (user_id, data_json, updated_at) VALUES (?, ?, ?)",
-                   (user_id, json.dumps(EMPTY_USER_FINANCIAL_DATA), now))
+    if DATABASE_URL:
+        cursor.execute(
+            "INSERT INTO users (name, email, password_hash, created_at) VALUES (%s, %s, %s, %s) RETURNING id",
+            (name, email, pw_hash, now)
+        )
+        user_id = cursor.fetchone()[0]
+        cursor.execute(
+            "INSERT INTO user_financial_data (user_id, data_json, updated_at) VALUES (%s, %s, %s)",
+            (user_id, json.dumps(EMPTY_USER_FINANCIAL_DATA), now)
+        )
+    else:
+        cursor.execute(
+            "INSERT INTO users (name, email, password_hash, created_at) VALUES (?, ?, ?, ?)",
+            (name, email, pw_hash, now)
+        )
+        user_id = cursor.lastrowid
+        cursor.execute(
+            "INSERT INTO user_financial_data (user_id, data_json, updated_at) VALUES (?, ?, ?)",
+            (user_id, json.dumps(EMPTY_USER_FINANCIAL_DATA), now)
+        )
+
     conn.commit()
     conn.close()
 
@@ -114,16 +168,24 @@ def login_user(req: LoginRequest):
     email = req.email.strip().lower()
     pw_hash = hash_password(req.password)
 
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT id, name, email, password_hash FROM users WHERE email = ?", (email,))
+    if DATABASE_URL:
+        cursor.execute("SELECT id, name, email, password_hash FROM users WHERE email = %s", (email,))
+    else:
+        cursor.execute("SELECT id, name, email, password_hash FROM users WHERE email = ?", (email,))
+
     row = cursor.fetchone()
     if not row or row[3] != pw_hash:
         conn.close()
         raise HTTPException(status_code=401, detail="Invalid email or password")
 
     user_id, name, user_email, _ = row
-    cursor.execute("SELECT data_json FROM user_financial_data WHERE user_id = ?", (user_id,))
+    if DATABASE_URL:
+        cursor.execute("SELECT data_json FROM user_financial_data WHERE user_id = %s", (user_id,))
+    else:
+        cursor.execute("SELECT data_json FROM user_financial_data WHERE user_id = ?", (user_id,))
+
     data_row = cursor.fetchone()
     user_data = json.loads(data_row[0]) if data_row else EMPTY_USER_FINANCIAL_DATA
     conn.close()
@@ -136,9 +198,13 @@ def login_user(req: LoginRequest):
 
 @app.get("/api/user/{user_id}/data")
 def get_user_data(user_id: int):
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT data_json FROM user_financial_data WHERE user_id = ?", (user_id,))
+    if DATABASE_URL:
+        cursor.execute("SELECT data_json FROM user_financial_data WHERE user_id = %s", (user_id,))
+    else:
+        cursor.execute("SELECT data_json FROM user_financial_data WHERE user_id = ?", (user_id,))
+
     row = cursor.fetchone()
     conn.close()
     if not row:
@@ -147,14 +213,22 @@ def get_user_data(user_id: int):
 
 @app.post("/api/user/data")
 def save_user_data(req: SaveUserDataRequest):
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_db_connection()
     cursor = conn.cursor()
     now = datetime.now().isoformat()
-    cursor.execute("""
-        INSERT INTO user_financial_data (user_id, data_json, updated_at)
-        VALUES (?, ?, ?)
-        ON CONFLICT(user_id) DO UPDATE SET data_json=excluded.data_json, updated_at=excluded.updated_at
-    """, (req.user_id, json.dumps(req.data), now))
+    if DATABASE_URL:
+        cursor.execute("""
+            INSERT INTO user_financial_data (user_id, data_json, updated_at)
+            VALUES (%s, %s, %s)
+            ON CONFLICT(user_id) DO UPDATE SET data_json=EXCLUDED.data_json, updated_at=EXCLUDED.updated_at
+        """, (req.user_id, json.dumps(req.data), now))
+    else:
+        cursor.execute("""
+            INSERT INTO user_financial_data (user_id, data_json, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET data_json=excluded.data_json, updated_at=excluded.updated_at
+        """, (req.user_id, json.dumps(req.data), now))
+
     conn.commit()
     conn.close()
     return {"status": "ok", "message": "Financial data saved to database"}
