@@ -66,7 +66,7 @@ def init_db():
     conn.commit()
     conn.close()
 
-app = FastAPI(title="Personal CFO AI Insights API")
+app = FastAPI(title="Personal CFO AI Insights API", redirect_slashes=False)
 
 app.add_middleware(
     CORSMiddleware,
@@ -108,9 +108,18 @@ EMPTY_USER_FINANCIAL_DATA = {
 def hash_password(password: str) -> str:
     return hashlib.sha256(password.encode("utf-8")).hexdigest()
 
+@app.get("/")
+def root_check():
+    return {"status": "ok", "service": "Personal CFO AI Backend"}
+
+@app.options("/{full_path:path}")
+def options_handler(full_path: str):
+    return {"status": "ok"}
+
 @app.get("/api/health")
 def health_check():
     return {"status": "ok", "service": "Personal CFO AI Backend Endpoint"}
+
 
 @app.post("/api/auth/register")
 def register_user(req: RegisterRequest):
