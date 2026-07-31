@@ -342,18 +342,107 @@ Respond ONLY with valid JSON inside a ```json block or raw JSON object.
     selected_provider = (snapshot.provider or "gemini").lower()
     custom_key = snapshot.api_key.strip() if snapshot.api_key else None
 
-    if not custom_key:
-        raise HTTPException(
-            status_code=400,
-            detail="API Key Required: Every user must provide their own Google Gemini or Anthropic Claude API key."
-        )
+    # Server-side environment key fallbacks
+    groq_env_key = os.getenv("GROQ_API_KEY")
+    openrouter_env_key = os.getenv("OPENROUTER_API_KEY")
+    gemini_env_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+    anthropic_env_key = os.getenv("ANTHROPIC_API_KEY")
 
-    # Handle Anthropic Claude API
-    if selected_provider == "anthropic" or custom_key.startswith("sk-ant-"):
+    # If offline requested or no key anywhere, use local heuristic CFO engine
+    if selected_provider in ["offline", "heuristic"] or (
+        not custom_key and not groq_env_key and not openrouter_env_key and not gemini_env_key and not anthropic_env_key
+    ):
+        res = generate_heuristic_cfo_insight(snapshot)
+        return CFOInsightResponse(**res)
+
+    # 1. Handle Groq API (100% Free, High Rate-Limits)
+    if selected_provider == "groq" or (custom_key and custom_key.startswith("gsk_")) or (not custom_key and groq_env_key):
+        active_key = custom_key or groq_env_key
+        try:
+            url = "https://api.groq.com/openai/v1/chat/completions"
+            headers = {
+                "Authorization": f"Bearer {active_key}",
+                "Content-Type": "application/json"
+            }
+            payload = {
+                "model": "llama-3.3-70b-versatile",
+                "messages": [{"role": "user", "content": prompt_text}],
+                "response_format": {"type": "json_object"},
+                "temperature": 0.3
+            }
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                resp = await client.post(url, headers=headers, json=payload)
+                res_data = resp.json()
+                if resp.status_code == 200:
+                    raw_text = res_data["choices"][0]["message"]["content"]
+                    cleaned_text = raw_text.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+                    parsed = json.loads(cleaned_text)
+                    return CFOInsightResponse(
+                        verdict=parsed.get("verdict", "WEALTH_BUILDING"),
+                        summary=parsed.get("summary", ""),
+                        recommendations=parsed.get("recommendations", [])
+                    )
+                else:
+                    err_msg = res_data.get("error", {}).get("message", f"Groq HTTP {resp.status_code}")
+                    print(f"Groq API Error ({resp.status_code}): {err_msg}")
+                    raise HTTPException(
+                        status_code=resp.status_code if resp.status_code in [400, 401, 403, 429] else 400,
+                        detail=f"Groq API Error: {err_msg}"
+                    )
+        except HTTPException:
+            raise
+        except Exception as e:
+            print(f"Groq Exception: {e}")
+            res = generate_heuristic_cfo_insight(snapshot)
+            return CFOInsightResponse(**res)
+
+    # 2. Handle OpenRouter API (Completely Free Models Available)
+    if selected_provider == "openrouter" or (custom_key and custom_key.startswith("sk-or-")) or (not custom_key and openrouter_env_key):
+        active_key = custom_key or openrouter_env_key
+        try:
+            url = "https://openrouter.ai/api/v1/chat/completions"
+            headers = {
+                "Authorization": f"Bearer {active_key}",
+                "Content-Type": "application/json"
+            }
+            payload = {
+                "model": "meta-llama/llama-3.3-70b-instruct:free",
+                "messages": [{"role": "user", "content": prompt_text}],
+                "temperature": 0.3
+            }
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                resp = await client.post(url, headers=headers, json=payload)
+                res_data = resp.json()
+                if resp.status_code == 200:
+                    raw_text = res_data["choices"][0]["message"]["content"]
+                    cleaned_text = raw_text.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+                    parsed = json.loads(cleaned_text)
+                    return CFOInsightResponse(
+                        verdict=parsed.get("verdict", "WEALTH_BUILDING"),
+                        summary=parsed.get("summary", ""),
+                        recommendations=parsed.get("recommendations", [])
+                    )
+                else:
+                    err_msg = res_data.get("error", {}).get("message", f"OpenRouter HTTP {resp.status_code}")
+                    print(f"OpenRouter API Error ({resp.status_code}): {err_msg}")
+                    raise HTTPException(
+                        status_code=resp.status_code if resp.status_code in [400, 401, 403, 429] else 400,
+                        detail=f"OpenRouter API Error: {err_msg}"
+                    )
+        except HTTPException:
+            raise
+        except Exception as e:
+            print(f"OpenRouter Exception: {e}")
+            res = generate_heuristic_cfo_insight(snapshot)
+            return CFOInsightResponse(**res)
+
+    # 3. Handle Anthropic Claude API
+    if selected_provider == "anthropic" or (custom_key and custom_key.startswith("sk-ant-")) or (not custom_key and anthropic_env_key):
+        active_key = custom_key or anthropic_env_key
         try:
             url = "https://api.anthropic.com/v1/messages"
             headers = {
-                "x-api-key": custom_key,
+                "x-api-key": active_key,
                 "anthropic-version": "2023-06-01",
                 "content-type": "application/json"
             }
@@ -385,11 +474,13 @@ Respond ONLY with valid JSON inside a ```json block or raw JSON object.
             raise
         except Exception as e:
             print(f"Anthropic Exception: {e}")
-            raise HTTPException(status_code=500, detail=f"Anthropic API request failed: {str(e)}")
+            res = generate_heuristic_cfo_insight(snapshot)
+            return CFOInsightResponse(**res)
 
-    # Handle Google Gemini API
+    # 4. Handle Google Gemini API
+    active_key = custom_key or gemini_env_key
     try:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={custom_key}"
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={active_key}"
         payload = {
             "contents": [{"parts": [{"text": prompt_text}]}],
             "generationConfig": {
@@ -400,7 +491,7 @@ Respond ONLY with valid JSON inside a ```json block or raw JSON object.
         async with httpx.AsyncClient(timeout=15.0) as client:
             resp = await client.post(url, json=payload)
             if resp.status_code == 404:
-                url = f"https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key={custom_key}"
+                url = f"https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key={active_key}"
                 resp = await client.post(url, json=payload)
 
             res_data = resp.json()
@@ -416,6 +507,10 @@ Respond ONLY with valid JSON inside a ```json block or raw JSON object.
             else:
                 err_msg = res_data.get("error", {}).get("message", f"Gemini HTTP {resp.status_code}")
                 print(f"Gemini API Error ({resp.status_code}): {err_msg}")
+                # If Gemini quota exceeded (429), auto-fallback to offline heuristic CFO engine instead of failing!
+                if resp.status_code == 429 or "quota" in err_msg.lower():
+                    res = generate_heuristic_cfo_insight(snapshot)
+                    return CFOInsightResponse(**res)
                 raise HTTPException(
                     status_code=resp.status_code if resp.status_code in [400, 401, 403, 429] else 400,
                     detail=f"Gemini API Error: {err_msg}"
@@ -424,7 +519,9 @@ Respond ONLY with valid JSON inside a ```json block or raw JSON object.
         raise
     except Exception as e:
         print(f"Gemini Exception: {e}")
-        raise HTTPException(status_code=500, detail=f"Gemini API request failed: {str(e)}")
+        res = generate_heuristic_cfo_insight(snapshot)
+        return CFOInsightResponse(**res)
+
 
 if __name__ == "__main__":
     import uvicorn
